@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 # ─── Version / constants ──────────────────────────────────────────────────────
-VERSION         = "1.2.1"
+VERSION         = "1.2.3"
 GOVEE_API_BASE  = "https://developer-api.govee.com/v1"
 REQUEST_TIMEOUT = 15       # HTTP request timeout (seconds)
 MAX_LOG_ENTRIES = 50       # in-memory activity log size
@@ -371,7 +371,7 @@ class GoveeLANClient:
         msg = json.dumps({"msg": {"cmd": cmd, "data": data}}).encode()
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.sendto(msg, (ip, LAN_UDP_PORT))
-        log.debug("LAN %s %s  data=%s", ip, cmd, data)
+        log.info("LAN → %s  cmd=%s  data=%s", ip, cmd, data)
 
     @staticmethod
     def get_state(ip: str) -> Optional[DeviceState]:
@@ -439,7 +439,9 @@ class GoveeDevice:
 
     @property
     def api_mode(self) -> str:
-        return "LAN" if self.use_lan else "Cloud"
+        if self.use_lan:
+            return "LAN"
+        return "Cloud (LAN configured but unreachable)" if self._lan_ip else "Cloud"
 
     def get_state(self) -> Optional[DeviceState]:
         try:
@@ -1648,6 +1650,21 @@ def main() -> None:
         GoveeDevice(d["id"], d["model"], d["label"], cloud, d["ip"])
         for d in config.devices
     ]
+
+    # Probe LAN devices at startup; disable LAN mode if unreachable
+    for dev in devices:
+        if dev.use_lan:
+            state = _LAN.get_state(dev._lan_ip)
+            if state is not None:
+                log.info("LAN probe OK  %s (%s): %s", dev.label, dev._lan_ip, state)
+            else:
+                log.warning(
+                    "LAN probe FAILED for %s (%s) — device is not responding to UDP on "
+                    "port 4003. Govee LAN control requires the server and device to be on "
+                    "the same subnet. Falling back to Cloud API for this device.",
+                    dev.label, dev._lan_ip,
+                )
+                dev.use_lan = False   # disable LAN for this device; use cloud instead
 
     alarm_sm = AlarmStateMachine(config, devices)
 
