@@ -74,7 +74,8 @@ All settings are environment variables (see `.env.example`).
 | `GOVEE_DEVICE2_LABEL` | `Light 2` | Display name in UI |
 | `GOVEE_DEVICE2_IP` | _(empty)_ | Local IP for LAN mode (optional) |
 | `WEBHOOK_PORT` | `8585` | HTTP listener port |
-| `ALARM_TIMEOUT` | `30` | Seconds before auto-restore |
+| `ALARM_TIMEOUT` | `30` | Seconds before auto-restore after a real alarm |
+| `TEST_DURATION` | `5` | Seconds a single-device test holds before restoring |
 | `DEFAULT_EFFECT` | `white` | Effect used when no `?effect=` param given |
 | `LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `LOG_FILE` | `/app/logs/govee_alarm.log` | Log file path (mounted to `./logs/`) |
@@ -153,10 +154,13 @@ The web UI at `:8585/` shows the full list of URLs with your hostname substitute
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Web UI |
-| `GET` | `/health` | JSON status |
+| `GET` | `/health` | JSON status (polled every 5 s by the UI) |
 | `GET` | `/webhook` | Connectivity probe (returns 200 OK) |
-| `POST` | `/webhook?effect=<name>` | Trigger alarm |
-| `POST` | `/test?effect=<name>` | Test trigger (same as webhook) |
+| `POST` | `/webhook?effect=<name>` | Trigger alarm on all devices |
+| `POST` | `/test?effect=<name>` | Test all devices (full alarm sequence) |
+| `POST` | `/test?effect=<name>&device=0` | Test one device (by index) |
+| `POST` | `/test-device?device=0&effect=<name>` | Test one device directly |
+| `GET` | `/govee-devices` | List devices registered to your API key |
 | `GET` | `/logs?lines=200` | Tail of log file as plain text |
 | `POST` | `/loglevel` | Change verbosity at runtime |
 
@@ -200,6 +204,24 @@ python3 govee_alarm.py
 ```
 
 ---
+
+## Troubleshooting
+
+### "Device Not Found" errors
+
+The Govee developer API uses a different device ID format than the MAC address printed on the device. The correct IDs are returned by the API itself:
+
+1. Click **"List all Govee devices"** on the web UI, or call `GET /govee-devices`
+2. Note the `device` and `model` fields for each light
+3. Update `.env` with the correct values and restart: `docker compose down && docker compose up -d`
+
+### Tests show no result / activity log doesn't update
+
+The activity log in the UI polls `/health` every 5 seconds automatically. After clicking a test button, wait up to 5 seconds for the result to appear. If the API call fails the error appears in the activity log.
+
+### API rate limits and slow animations
+
+The Govee cloud API allows ~100 requests/minute. Each API command (power, brightness, colour) counts separately, and the service enforces a minimum 1.15 s gap between calls. For fast strobe/cycle effects, enable LAN mode by setting `GOVEE_DEVICE1_IP`.
 
 ## Architecture
 

@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 # ─── Version / constants ──────────────────────────────────────────────────────
-VERSION         = "1.1.0"
+VERSION         = "1.2.0"
 GOVEE_API_BASE  = "https://developer-api.govee.com/v1"
 REQUEST_TIMEOUT = 15       # HTTP request timeout (seconds)
 MAX_LOG_ENTRIES = 50       # in-memory activity log size
@@ -204,6 +204,7 @@ class Config:
 
         self.webhook_port   = int(os.environ.get("WEBHOOK_PORT", "8585"))
         self.alarm_timeout  = int(os.environ.get("ALARM_TIMEOUT", "30"))
+        self.test_duration  = int(os.environ.get("TEST_DURATION", "5"))
         self.default_effect = os.environ.get("DEFAULT_EFFECT", "white")
         self.log_level      = os.environ.get("LOG_LEVEL", "INFO").upper()
         self.log_file       = os.environ.get("LOG_FILE", "/app/logs/govee_alarm.log")
@@ -220,6 +221,8 @@ class Config:
             raise ValueError("Configuration errors:\n" + "\n".join(f"  - {e}" for e in errors))
         if self.alarm_timeout < 1:
             self.alarm_timeout = 1
+        if self.test_duration < 1:
+            self.test_duration = 1
         if self.default_effect not in EFFECTS:
             self.default_effect = "white"
 
@@ -497,6 +500,10 @@ class AlarmStateMachine:
         self._timer: Optional[threading.Timer] = None
         self._anim_stop = threading.Event()
 
+        # Single-device test lock — prevents overlapping device tests
+        self._test_lock = threading.Lock()
+        self._test_in_progress: Optional[str] = None  # device label currently under test
+
         # Activity log: list of (iso_timestamp, level, message) newest-first
         self.activity_log: List[Tuple[str, str, str]] = []
         self.triggered_at:  Optional[str] = None
@@ -567,9 +574,11 @@ class AlarmStateMachine:
 
     def test_device(self, device_idx: int, effect_name: str) -> None:
         """
-        Apply effect to a single device for ALARM_TIMEOUT seconds then restore.
-        Runs in a background thread; skipped if the system is not idle.
-        For cycle/blink effects the first colour is used (static flash).
+        Apply effect to one device for TEST_DURATION seconds then restore.
+        - Skipped if the alarm FSM is not idle.
+        - Skipped if another device test is already in progress (one at a time).
+        - Aborts early and restores if a real alarm fires during the test.
+        - For cycle/blink effects the first colour is shown (static flash).
         """
         if device_idx < 0 or device_idx >= len(self.devices):
             self._log("warning", "Test: device index %d out of range", device_idx)
@@ -580,18 +589,22 @@ class AlarmStateMachine:
         if effect_name not in EFFECTS:
             effect_name = self.config.default_effect
 
+        if not self._test_lock.acquire(blocking=False):
+            self._log("warning", "Test: another test is already running (%s) — skipped",
+                      self._test_in_progress or "unknown")
+            return
+
         dev    = self.devices[device_idx]
         effect = EFFECTS[effect_name]
         etype  = effect["type"]
+        self._test_in_progress = dev.label
         self._log("info", "Test %s — %s (%ds)", dev.label, effect["label"],
-                  self.config.alarm_timeout)
+                  self.config.test_duration)
 
         saved = dev.get_state()
 
-        # Determine colour to show (first frame for animated effects)
-        if etype == "static":
-            r, g, b = effect["color"]
-        elif etype == "blink":
+        # Resolve colour (first frame for animated effects)
+        if etype in ("static", "blink"):
             r, g, b = effect["color"]
         else:  # cycle
             r, g, b = effect["colors"][0]
@@ -601,18 +614,34 @@ class AlarmStateMachine:
             dev.apply_color(r, g, b, br)
         except APIError as exc:
             self._log("error", "Test failed for %s: %s", dev.label, exc)
+            if "Device Not Found" in str(exc) or "400" in str(exc):
+                self._log("warning",
+                          "Hint: device ID/model may be wrong. Use 'List all Govee devices' "
+                          "button to find the correct values for your .env file.")
+            self._test_in_progress = None
+            self._test_lock.release()
             return
 
-        time.sleep(self.config.alarm_timeout)
+        # Wait for test duration; abort early if a real alarm fires
+        deadline = time.monotonic() + self.config.test_duration
+        while time.monotonic() < deadline:
+            if self._state != IDLE:
+                self._log("info", "Test aborted for %s — alarm triggered", dev.label)
+                break
+            time.sleep(0.5)
 
         try:
             if saved:
                 dev.restore(saved)
             else:
                 dev.power(False)
-            self._log("info", "Test complete for %s", dev.label)
+            if self._state == IDLE:
+                self._log("info", "Test complete for %s", dev.label)
         except APIError as exc:
             self._log("error", "Test restore failed for %s: %s", dev.label, exc)
+        finally:
+            self._test_in_progress = None
+            self._test_lock.release()
 
     def status(self) -> dict:
         with self._lock:
@@ -624,7 +653,8 @@ class AlarmStateMachine:
                 "triggered_at":         self.triggered_at,
                 "restored_at":          self.restored_at,
                 "trigger_count":        self.trigger_count,
-                "log":                  list(self.activity_log[:20]),
+                "test_in_progress":     self._test_in_progress,
+                "log":                  list(self.activity_log[:50]),
                 "devices": [
                     {"id": d.id, "label": d.label, "mode": d.api_mode}
                     for d in self.devices
@@ -796,19 +826,16 @@ class AlarmStateMachine:
 
     def _restore(self) -> None:
         time.sleep(1.0)   # let animation threads exit
-        try:
-            for dev in self.devices:
+        for dev in self.devices:
+            try:
                 saved = self._saved_states.get(dev.id)
                 if saved is not None:
                     dev.restore(saved)
                 else:
                     self._log("warning", "No saved state for %s — turning off", dev.label)
-                    try:
-                        dev.power(False)
-                    except APIError as exc:
-                        self._log("error", "Could not turn off %s: %s", dev.label, exc)
-        except APIError as exc:
-            self._log("error", "Restore failed: %s", exc)
+                    dev.power(False)
+            except APIError as exc:
+                self._log("error", "Restore failed for %s: %s", dev.label, exc)
 
         with self._lock:
             self._state          = IDLE
@@ -1093,15 +1120,28 @@ def _render_ui(status: dict, config: Config) -> str:
             f'</div>'
         )
 
-    # Auto-refresh meta if alarmed
-    auto_refresh = '<meta http-equiv="refresh" content="5">' if state == ALARMED else ""
+    # Device options for the "Test Alarm" card device selector
+    dev_opts = '<option value="all">All devices</option>\n'
+    for i, d in enumerate(devices):
+        dev_opts += f'<option value="{i}">{_html_escape(d["label"])}</option>\n'
+
+    # Device Not Found warning — shown when recent log contains the hint
+    recent_msgs = " ".join(m for _, _, m in log_entries[:10])
+    device_not_found = "Device Not Found" in recent_msgs or "device ID/model may be wrong" in recent_msgs
+
+    dnf_display = "" if device_not_found else ' style="display:none"'
+    dnf_banner = f"""<div id="dnf-banner" class="banner-warn"{dnf_display}>
+  &#9888; One or more devices returned <strong>Device Not Found</strong> from the Govee API.
+  The device IDs or model strings in your <code>.env</code> are likely wrong.
+  Click <strong>"List all Govee devices"</strong> in the Devices card below to find the correct values,
+  then update <code>GOVEE_DEVICE1_ID</code> / <code>GOVEE_DEVICE1_MODEL</code> and restart the container.
+</div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{auto_refresh}
 <title>Govee Alarm — UniFi Protect</title>
 <style>
   :root {{
@@ -1168,6 +1208,11 @@ def _render_ui(status: dict, config: Config) -> str:
   .log-debug td   {{ color: var(--muted); }}
   code {{ font-family: 'Courier New', monospace; }}
   .section-title {{ font-size: 1rem; font-weight: 600; margin: 1.5rem 0 0.75rem; color: var(--accent); }}
+  .banner-warn {{ background: #451a03; border: 1px solid #92400e; color: #fde68a;
+                  padding: 0.75rem 1.25rem; font-size: 0.88rem; line-height: 1.6; }}
+  #refresh-dot {{ width:8px; height:8px; border-radius:50%; background:var(--muted);
+                  display:inline-block; margin-left:0.5rem; transition:background 0.3s; }}
+  #refresh-dot.active {{ background:var(--idle); }}
 </style>
 </head>
 <body>
@@ -1175,9 +1220,12 @@ def _render_ui(status: dict, config: Config) -> str:
   <div>
     <h1>Govee Alarm ⚡ UniFi Protect</h1>
     <div class="sub">v{VERSION} &nbsp;·&nbsp; port {config.webhook_port} &nbsp;·&nbsp;
-      timeout {alarm_timeout}s &nbsp;·&nbsp; {len(config.devices)} device(s)</div>
+      alarm {alarm_timeout}s &nbsp;·&nbsp; test {config.test_duration}s &nbsp;·&nbsp;
+      {len(config.devices)} device(s)
+      <span id="refresh-dot" title="Live log polling"></span></div>
   </div>
 </header>
+{dnf_banner}
 <main>
 
 <div class="grid">
@@ -1186,17 +1234,21 @@ def _render_ui(status: dict, config: Config) -> str:
   <div class="card">
     <h2>System Status</h2>
     <div class="kv"><span class="k">Alarm state</span>
-      <span class="v"><span class="badge {state_badge_class}">{state}</span></span></div>
+      <span class="v"><span id="state-badge" class="badge {state_badge_class}">{state}</span></span></div>
     <div class="kv"><span class="k">Active effect</span>
-      <span class="v">{effect_label or '—'}</span></div>
-    <div class="kv"><span class="k">Timeout</span>
+      <span class="v" id="effect-label">{effect_label or '—'}</span></div>
+    <div class="kv"><span class="k">Alarm timeout</span>
       <span class="v">{alarm_timeout} s</span></div>
+    <div class="kv"><span class="k">Test duration</span>
+      <span class="v">{config.test_duration} s</span></div>
     <div class="kv"><span class="k">Triggered at</span>
-      <span class="v ts" data-utc="{triggered_at}">{triggered_at}</span></div>
+      <span class="v ts" id="triggered-at" data-utc="{triggered_at}">{triggered_at}</span></div>
     <div class="kv"><span class="k">Restored at</span>
-      <span class="v ts" data-utc="{restored_at}">{restored_at}</span></div>
+      <span class="v ts" id="restored-at" data-utc="{restored_at}">{restored_at}</span></div>
     <div class="kv"><span class="k">Total triggers</span>
-      <span class="v">{trigger_count}</span></div>
+      <span class="v" id="trigger-count">{trigger_count}</span></div>
+    <div class="kv"><span class="k">Device test</span>
+      <span class="v" id="test-progress" style="color:var(--yellow)"></span></div>
     <div class="kv"><span class="k">Log verbosity</span>
       <span class="v" id="cur-level">{current_log_level}</span></div>
   </div>
@@ -1222,11 +1274,17 @@ def _render_ui(status: dict, config: Config) -> str:
   <div class="card">
     <h2>Test Alarm</h2>
     <form id="test-form">
+      <label style="color:var(--muted);font-size:0.82rem">Device</label>
+      <select name="device">{dev_opts}</select>
       <label style="color:var(--muted);font-size:0.82rem">Effect</label>
       <select name="effect">{effect_opts}</select>
       <button type="submit">Trigger Now</button>
     </form>
     <div id="test-msg" style="display:none" class="msg"></div>
+    <div style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">
+      "All devices" goes through the full alarm sequence (saves &amp; restores state).
+      Individual device tests run for <strong>{config.test_duration}s</strong> then restore.
+    </div>
   </div>
 
   <!-- Log verbosity -->
@@ -1284,13 +1342,13 @@ def _render_ui(status: dict, config: Config) -> str:
 
 </main>
 <script>
-  // Localise UTC timestamps to browser timezone
+  // ── Timestamp localisation ─────────────────────────────────────────────────
+  function localTs(utc) {{
+    if (!utc || utc === '—') return utc;
+    try {{ return new Date(utc).toLocaleString(); }} catch(_) {{ return utc; }}
+  }}
   document.querySelectorAll('.ts[data-utc]').forEach(el => {{
-    const v = el.dataset.utc;
-    if (!v || v === '—') return;
-    try {{
-      el.textContent = new Date(v).toLocaleString();
-    }} catch(_) {{}}
+    el.textContent = localTs(el.dataset.utc);
   }});
 
   // Replace <host> in webhook URLs
@@ -1298,57 +1356,124 @@ def _render_ui(status: dict, config: Config) -> str:
     el.textContent = el.textContent.replace('<host>', location.hostname);
   }});
 
-  // Test form submission
+  // ── Live log polling ───────────────────────────────────────────────────────
+  const dot = document.getElementById('refresh-dot');
+  const LEVEL_CLS = {{error:'log-error', warning:'log-warning', debug:'log-debug'}};
+
+  function renderLogRows(entries) {{
+    return entries.map(([ts, lvl, msg]) => {{
+      const cls = LEVEL_CLS[lvl] || '';
+      const escaped = msg.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return `<tr class="${{cls}}"><td class="ts">${{localTs(ts)}}</td>`
+           + `<td class="lv">${{lvl.toUpperCase()}}</td><td>${{escaped}}</td></tr>`;
+    }}).join('');
+  }}
+
+  async function pollHealth() {{
+    dot.classList.add('active');
+    try {{
+      const r = await fetch('/health');
+      const d = await r.json();
+
+      // State badge
+      const badgeMap = {{idle:'badge-idle', alarmed:'badge-alarmed', restoring:'badge-restoring'}};
+      const badgeEl = document.getElementById('state-badge');
+      if (badgeEl) {{
+        badgeEl.className = 'badge ' + (badgeMap[d.state] || 'badge-idle');
+        badgeEl.textContent = d.state;
+      }}
+
+      // Dynamic text fields
+      const set = (id, val) => {{ const e=document.getElementById(id); if(e) e.textContent=val||'—'; }};
+      set('effect-label',   d.current_effect_label);
+      set('triggered-at',   localTs(d.triggered_at));
+      set('restored-at',    localTs(d.restored_at));
+      set('trigger-count',  d.trigger_count);
+      set('test-progress',  d.test_in_progress ? ('Testing: ' + d.test_in_progress) : '');
+
+      // Activity log
+      const tbody = document.getElementById('log-tbody');
+      if (tbody && d.log) tbody.innerHTML = renderLogRows(d.log);
+
+      // Device Not Found banner
+      const recentMsgs = (d.log||[]).slice(0,10).map(e=>e[2]).join(' ');
+      const hasDNF = recentMsgs.includes('Device Not Found') || recentMsgs.includes('device ID/model may be wrong');
+      const banner = document.getElementById('dnf-banner');
+      if (banner) banner.style.display = hasDNF ? '' : 'none';
+
+    }} catch(_) {{}}
+    setTimeout(() => {{ dot.classList.remove('active'); }}, 400);
+    setTimeout(pollHealth, 5000);
+  }}
+  setTimeout(pollHealth, 5000);
+
+  // ── Test Alarm form ────────────────────────────────────────────────────────
   document.getElementById('test-form').addEventListener('submit', async e => {{
     e.preventDefault();
     const effect = e.target.effect.value;
+    const device = e.target.device.value;
     const msgEl  = document.getElementById('test-msg');
+
+    let url;
+    if (device === 'all') {{
+      url = '/test?effect=' + encodeURIComponent(effect);
+    }} else {{
+      url = '/test-device?device=' + device + '&effect=' + encodeURIComponent(effect);
+    }}
+
     try {{
-      const r = await fetch('/test?effect=' + encodeURIComponent(effect), {{method:'POST'}});
-      const d = await r.json();
+      const r = await fetch(url, {{method:'POST'}});
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       msgEl.className = 'msg ok';
-      msgEl.textContent = 'Triggered: ' + d.effect;
+      msgEl.textContent = device === 'all'
+        ? 'Alarm triggered — check activity log for result'
+        : 'Device test started — check activity log for result';
     }} catch(err) {{
       msgEl.className = 'msg err';
-      msgEl.textContent = 'Error: ' + err;
+      msgEl.textContent = 'Request failed: ' + err;
     }}
     msgEl.style.display = 'block';
-    setTimeout(() => {{ msgEl.style.display='none'; location.reload(); }}, 2000);
+    setTimeout(() => {{ msgEl.style.display='none'; }}, 4000);
   }});
 
-  // Per-device test buttons
+  // ── Per-device test buttons (in device cards) ──────────────────────────────
   document.querySelectorAll('.dev-test-btn').forEach(btn => {{
     btn.addEventListener('click', async () => {{
       const deviceIdx = btn.dataset.device;
       const sel    = document.querySelector('.dev-effect-sel[data-device="' + deviceIdx + '"]');
       const effect = sel ? sel.value : 'white';
       const orig   = btn.textContent;
-      btn.textContent = 'Sent…';
+      btn.textContent = 'Sent';
       btn.disabled = true;
       try {{
         const r = await fetch(
           '/test-device?device=' + deviceIdx + '&effect=' + encodeURIComponent(effect),
-          {{method: 'POST'}}
+          {{method:'POST'}}
         );
-        const d = await r.json();
-        btn.textContent = d.testing ? 'Testing…' : 'Error';
+        if (!r.ok) throw new Error('HTTP ' + r.status);
       }} catch(err) {{
-        btn.textContent = 'Error';
+        btn.textContent = 'Err';
       }}
-      setTimeout(() => {{ btn.textContent = orig; btn.disabled = false; }}, 5000);
+      setTimeout(() => {{ btn.textContent = orig; btn.disabled = false; }},
+                 {config.test_duration * 1000 + 2000});
     }});
   }});
 
-  // List Govee devices
+  // ── List Govee devices ─────────────────────────────────────────────────────
   document.getElementById('list-devices-btn').addEventListener('click', async () => {{
     const btn = document.getElementById('list-devices-btn');
     const out = document.getElementById('govee-devices-out');
     btn.textContent = 'Loading…';
     btn.disabled = true;
     try {{
-      const r = await fetch('/govee-devices');
-      const d = await r.json();
-      out.textContent = JSON.stringify(d, null, 2);
+      const r   = await fetch('/govee-devices');
+      const raw = await r.json();
+      // Show key fields clearly
+      const summary = Array.isArray(raw) ? raw.map(d => ({{
+        device: d.device, model: d.model, name: d.deviceName,
+        controllable: d.controllable, retrievable: d.retrievable,
+      }})) : raw;
+      out.textContent = JSON.stringify(summary, null, 2);
       out.style.display = 'block';
     }} catch(err) {{
       out.textContent = 'Error: ' + err;
@@ -1358,7 +1483,7 @@ def _render_ui(status: dict, config: Config) -> str:
     btn.disabled = false;
   }});
 
-  // Log level form
+  // ── Log level form ─────────────────────────────────────────────────────────
   document.getElementById('level-form').addEventListener('submit', async e => {{
     e.preventDefault();
     const level  = e.target.level.value;
@@ -1459,6 +1584,7 @@ def main() -> None:
                  f"  [LAN {config.device2_ip}]" if config.device2_ip else "  [Cloud]")
     log.info("Port         : %d", config.webhook_port)
     log.info("Alarm timeout: %d s", config.alarm_timeout)
+    log.info("Test duration : %d s", config.test_duration)
     log.info("Default effect: %s", config.default_effect)
     log.info("Log level    : %s", config.log_level)
     log.info("Log file     : %s", config.log_file or "(disabled)")
