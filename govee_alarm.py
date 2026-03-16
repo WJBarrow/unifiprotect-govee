@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 # ─── Version / constants ──────────────────────────────────────────────────────
-VERSION         = "1.0.0"
+VERSION         = "1.1.0"
 GOVEE_API_BASE  = "https://developer-api.govee.com/v1"
 REQUEST_TIMEOUT = 15       # HTTP request timeout (seconds)
 MAX_LOG_ENTRIES = 50       # in-memory activity log size
@@ -335,6 +335,11 @@ class GoveeCloudClient:
     def color(self, device_id: str, model: str, r: int, g: int, b: int) -> None:
         self._cmd(device_id, model, "color", {"r": r, "g": g, "b": b})
 
+    def list_devices(self) -> List[dict]:
+        """Return all devices registered under this API key."""
+        result = self._req("GET", "/devices")
+        return result.get("data", {}).get("devices", [])
+
 
 # ─── Govee LAN UDP API ────────────────────────────────────────────────────────
 class GoveeLANClient:
@@ -560,6 +565,55 @@ class AlarmStateMachine:
                     args=(effect_name,), daemon=True,
                 ).start()
 
+    def test_device(self, device_idx: int, effect_name: str) -> None:
+        """
+        Apply effect to a single device for ALARM_TIMEOUT seconds then restore.
+        Runs in a background thread; skipped if the system is not idle.
+        For cycle/blink effects the first colour is used (static flash).
+        """
+        if device_idx < 0 or device_idx >= len(self.devices):
+            self._log("warning", "Test: device index %d out of range", device_idx)
+            return
+        if self._state != IDLE:
+            self._log("warning", "Test: system not idle (state=%s) — skipped", self._state)
+            return
+        if effect_name not in EFFECTS:
+            effect_name = self.config.default_effect
+
+        dev    = self.devices[device_idx]
+        effect = EFFECTS[effect_name]
+        etype  = effect["type"]
+        self._log("info", "Test %s — %s (%ds)", dev.label, effect["label"],
+                  self.config.alarm_timeout)
+
+        saved = dev.get_state()
+
+        # Determine colour to show (first frame for animated effects)
+        if etype == "static":
+            r, g, b = effect["color"]
+        elif etype == "blink":
+            r, g, b = effect["color"]
+        else:  # cycle
+            r, g, b = effect["colors"][0]
+        br = effect.get("brightness", 100)
+
+        try:
+            dev.apply_color(r, g, b, br)
+        except APIError as exc:
+            self._log("error", "Test failed for %s: %s", dev.label, exc)
+            return
+
+        time.sleep(self.config.alarm_timeout)
+
+        try:
+            if saved:
+                dev.restore(saved)
+            else:
+                dev.power(False)
+            self._log("info", "Test complete for %s", dev.label)
+        except APIError as exc:
+            self._log("error", "Test restore failed for %s: %s", dev.label, exc)
+
     def status(self) -> dict:
         with self._lock:
             return {
@@ -778,13 +832,15 @@ class WebHandler(BaseHTTPRequestHandler):
     """
     HTTP endpoints:
 
-    GET  /             Web UI
-    GET  /health       JSON status
-    GET  /webhook      Connectivity probe (UniFi Protect tests this)
-    POST /webhook      Alarm trigger  (?effect=<name>)
-    POST /test         Test trigger from UI (?effect=<name>)
-    GET  /logs         Last N lines of log file as plain text
-    POST /loglevel     Change log verbosity  body: {"level":"DEBUG"}
+    GET  /                Web UI
+    GET  /health          JSON status
+    GET  /webhook         Connectivity probe (UniFi Protect tests this)
+    POST /webhook         Alarm trigger  (?effect=<name>)
+    POST /test            Test all devices (?effect=<name>)
+    POST /test-device     Test one device  (?device=0|1&effect=<name>)
+    GET  /govee-devices   List devices registered to the API key
+    GET  /logs            Last N lines of log file as plain text
+    POST /loglevel        Change log verbosity  body: {"level":"DEBUG"}
     """
 
     alarm_sm: AlarmStateMachine = None   # set by main()
@@ -807,6 +863,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send(200, "text/plain", b"OK")   # UniFi connectivity probe
         elif path == "/logs":
             self._serve_logs()
+        elif path == "/govee-devices":
+            self._serve_govee_devices()
         else:
             self._send(404, "text/plain", b"Not Found")
 
@@ -816,6 +874,8 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path in ("/webhook", "/test"):
             self._handle_trigger(parsed)
+        elif path == "/test-device":
+            self._handle_test_device(parsed)
         elif path == "/loglevel":
             self._handle_loglevel()
         else:
@@ -861,6 +921,39 @@ class WebHandler(BaseHTTPRequestHandler):
             "triggers": triggers,
         }).encode()
         self._send(200, "application/json", resp)
+
+    def _handle_test_device(self, parsed) -> None:
+        qs     = parse_qs(parsed.query)
+        effect = qs.get("effect", [self.config.default_effect])[0]
+        dev_str = qs.get("device", ["0"])[0]
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)   # consume body
+        try:
+            device_idx = int(dev_str)
+        except ValueError:
+            self._send(400, "text/plain", b"device param must be 0 or 1")
+            return
+        if effect not in EFFECTS:
+            effect = self.config.default_effect
+        threading.Thread(
+            target=self.alarm_sm.test_device,
+            args=(device_idx, effect),
+            daemon=True,
+        ).start()
+        resp = json.dumps({"testing": True, "device": device_idx, "effect": effect}).encode()
+        self._send(200, "application/json", resp)
+
+    def _serve_govee_devices(self) -> None:
+        """Proxy GET /v1/devices so the UI can show what the API key can see."""
+        try:
+            cloud   = GoveeCloudClient(self.config.api_key)
+            devices = cloud.list_devices()
+            self._send(200, "application/json",
+                       json.dumps(devices, indent=2).encode())
+        except APIError as exc:
+            self._send(500, "application/json",
+                       json.dumps({"error": str(exc)}).encode())
 
     def _handle_loglevel(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -982,14 +1075,21 @@ def _render_ui(status: dict, config: Config) -> str:
             f'<td>{_html_escape(msg)}</td></tr>\n'
         )
 
-    # Device cards
+    # Device cards with per-device test controls
     device_cards = ""
-    for d in devices:
+    for i, d in enumerate(devices):
         device_cards += (
             f'<div class="dev-card">'
+            f'<div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;width:100%">'
             f'<span class="dev-label">{_html_escape(d["label"])}</span>'
             f'<span class="dev-id"><code>{d["id"][:12]}…</code></span>'
             f'<span class="dev-mode mode-{d["mode"].lower()}">{d["mode"]}</span>'
+            f'</div>'
+            f'<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;width:100%">'
+            f'<select class="dev-effect-sel" data-device="{i}" style="flex:1;font-size:0.8rem">{effect_opts}</select>'
+            f'<button class="dev-test-btn secondary" data-device="{i}" type="button" '
+            f'style="white-space:nowrap;padding:0.35rem 0.75rem;font-size:0.8rem">Test</button>'
+            f'</div>'
             f'</div>'
         )
 
@@ -1108,6 +1208,14 @@ def _render_ui(status: dict, config: Config) -> str:
     <div style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">
       LAN = local UDP (fast) &nbsp;·&nbsp; Cloud = Govee HTTP API
     </div>
+    <button id="list-devices-btn" class="secondary"
+            style="margin-top:0.75rem;width:100%;font-size:0.8rem" type="button">
+      List all Govee devices on this API key
+    </button>
+    <pre id="govee-devices-out"
+         style="display:none;margin-top:0.5rem;background:var(--bg);padding:0.75rem;
+                border-radius:6px;font-size:0.75rem;overflow-x:auto;max-height:200px;
+                border:1px solid var(--border)"></pre>
   </div>
 
   <!-- Test alarm -->
@@ -1206,6 +1314,48 @@ def _render_ui(status: dict, config: Config) -> str:
     }}
     msgEl.style.display = 'block';
     setTimeout(() => {{ msgEl.style.display='none'; location.reload(); }}, 2000);
+  }});
+
+  // Per-device test buttons
+  document.querySelectorAll('.dev-test-btn').forEach(btn => {{
+    btn.addEventListener('click', async () => {{
+      const deviceIdx = btn.dataset.device;
+      const sel    = document.querySelector('.dev-effect-sel[data-device="' + deviceIdx + '"]');
+      const effect = sel ? sel.value : 'white';
+      const orig   = btn.textContent;
+      btn.textContent = 'Sent…';
+      btn.disabled = true;
+      try {{
+        const r = await fetch(
+          '/test-device?device=' + deviceIdx + '&effect=' + encodeURIComponent(effect),
+          {{method: 'POST'}}
+        );
+        const d = await r.json();
+        btn.textContent = d.testing ? 'Testing…' : 'Error';
+      }} catch(err) {{
+        btn.textContent = 'Error';
+      }}
+      setTimeout(() => {{ btn.textContent = orig; btn.disabled = false; }}, 5000);
+    }});
+  }});
+
+  // List Govee devices
+  document.getElementById('list-devices-btn').addEventListener('click', async () => {{
+    const btn = document.getElementById('list-devices-btn');
+    const out = document.getElementById('govee-devices-out');
+    btn.textContent = 'Loading…';
+    btn.disabled = true;
+    try {{
+      const r = await fetch('/govee-devices');
+      const d = await r.json();
+      out.textContent = JSON.stringify(d, null, 2);
+      out.style.display = 'block';
+    }} catch(err) {{
+      out.textContent = 'Error: ' + err;
+      out.style.display = 'block';
+    }}
+    btn.textContent = 'Refresh device list';
+    btn.disabled = false;
   }});
 
   // Log level form
