@@ -1,0 +1,11 @@
+services:
+  govee-alarm:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${WEBHOOK_PORT:-8585}:${WEBHOOK_PORT:-8585}"
+    env_file:
+      - .env
+    volumes:
+      # Persist log files across container restarts
+      - ./logs:/app/logs
