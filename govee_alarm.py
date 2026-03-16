@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 # ─── Version / constants ──────────────────────────────────────────────────────
-VERSION         = "1.2.0"
+VERSION         = "1.2.1"
 GOVEE_API_BASE  = "https://developer-api.govee.com/v1"
 REQUEST_TIMEOUT = 15       # HTTP request timeout (seconds)
 MAX_LOG_ENTRIES = 50       # in-memory activity log size
@@ -242,18 +242,27 @@ class Config:
 
 # ─── Device state snapshot ───────────────────────────────────────────────────
 class DeviceState:
-    """Snapshot of a Govee device's state, used for restoration."""
-    __slots__ = ("power_on", "brightness", "r", "g", "b")
+    """
+    Snapshot of a Govee device's state, used for restoration.
+
+    NOTE: The Govee API only exposes power, brightness, RGB colour, and colour
+    temperature.  Scene / DIY / Music modes are not queryable or restorable via
+    the API.  If the device was running a scene, the best we can do is restore
+    the colour temperature (if the API reported one) or the RGB approximation.
+    """
+    __slots__ = ("power_on", "brightness", "r", "g", "b", "color_temp")
 
     def __init__(self, power_on: bool = True, brightness: int = 100,
-                 r: int = 255, g: int = 255, b: int = 255) -> None:
+                 r: int = 255, g: int = 255, b: int = 255,
+                 color_temp: int = 0) -> None:
         self.power_on   = power_on
         self.brightness = brightness
         self.r, self.g, self.b = r, g, b
+        self.color_temp = color_temp   # Kelvin, 0 = not in colour-temp mode
 
     def __repr__(self) -> str:
-        return (f"DeviceState(power={'on' if self.power_on else 'off'}, "
-                f"brightness={self.brightness}, rgb=({self.r},{self.g},{self.b}))")
+        mode = f"colorTem={self.color_temp}K" if self.color_temp else f"rgb=({self.r},{self.g},{self.b})"
+        return f"DeviceState(power={'on' if self.power_on else 'off'}, brightness={self.brightness}, {mode})"
 
 
 # ─── Govee Cloud HTTP API ─────────────────────────────────────────────────────
@@ -313,13 +322,15 @@ class GoveeCloudClient:
         props: Dict[str, Any] = {}
         for item in result.get("data", {}).get("properties", []):
             props.update(item)
-        color = props.get("color", {"r": 255, "g": 255, "b": 255})
+        color      = props.get("color", {"r": 255, "g": 255, "b": 255})
+        color_temp = int(props.get("colorTem", 0))
         return DeviceState(
             power_on   = props.get("powerState", "on") == "on",
             brightness = int(props.get("brightness", 100)),
-            r = int(color.get("r", 255)),
-            g = int(color.get("g", 255)),
-            b = int(color.get("b", 255)),
+            r          = int(color.get("r", 255)),
+            g          = int(color.get("g", 255)),
+            b          = int(color.get("b", 255)),
+            color_temp = color_temp,
         )
 
     def _cmd(self, device_id: str, model: str, name: str, value: Any) -> None:
@@ -337,6 +348,9 @@ class GoveeCloudClient:
 
     def color(self, device_id: str, model: str, r: int, g: int, b: int) -> None:
         self._cmd(device_id, model, "color", {"r": r, "g": g, "b": b})
+
+    def color_temp(self, device_id: str, model: str, kelvin: int) -> None:
+        self._cmd(device_id, model, "colorTem", max(2000, min(9000, kelvin)))
 
     def list_devices(self) -> List[dict]:
         """Return all devices registered under this API key."""
@@ -367,14 +381,16 @@ class GoveeLANClient:
             try:
                 s.sendto(msg, (ip, LAN_UDP_PORT))
                 raw, _ = s.recvfrom(4096)
-                d = json.loads(raw).get("msg", {}).get("data", {})
-                color = d.get("color", {"r": 255, "g": 255, "b": 255})
+                d          = json.loads(raw).get("msg", {}).get("data", {})
+                color      = d.get("color", {"r": 255, "g": 255, "b": 255})
+                color_temp = int(d.get("colorTemInKelvin", 0))
                 return DeviceState(
                     power_on   = d.get("onOff", 1) == 1,
                     brightness = int(d.get("brightness", 100)),
-                    r = int(color.get("r", 255)),
-                    g = int(color.get("g", 255)),
-                    b = int(color.get("b", 255)),
+                    r          = int(color.get("r", 255)),
+                    g          = int(color.get("g", 255)),
+                    b          = int(color.get("b", 255)),
+                    color_temp = color_temp,
                 )
             except (socket.timeout, json.JSONDecodeError, OSError):
                 return None
@@ -392,6 +408,13 @@ class GoveeLANClient:
         GoveeLANClient._send(ip, "colorwc", {
             "color": {"r": r, "g": g, "b": b},
             "colorTemInKelvin": 0,
+        })
+
+    @staticmethod
+    def color_temp(ip: str, kelvin: int) -> None:
+        GoveeLANClient._send(ip, "colorwc", {
+            "color": {"r": 0, "g": 0, "b": 0},
+            "colorTemInKelvin": max(2000, min(9000, kelvin)),
         })
 
 
@@ -451,6 +474,13 @@ class GoveeDevice:
         else:
             self._cloud.color(self.id, self.model, r, g, b)
 
+    def color_temp(self, kelvin: int) -> None:
+        log.debug("%s → colorTem %dK", self.label, kelvin)
+        if self.use_lan:
+            _LAN.color_temp(self._lan_ip, kelvin)
+        else:
+            self._cloud.color_temp(self.id, self.model, kelvin)
+
     def apply_color(self, r: int, g: int, b: int, br: int = 100) -> None:
         """Turn on, set brightness, set colour. LAN calls need a small gap."""
         self.power(True)
@@ -474,7 +504,15 @@ class GoveeDevice:
         self.brightness(state.brightness)
         if gap:
             time.sleep(gap)
-        self.color(state.r, state.g, state.b)
+        if state.color_temp:
+            # Device was in colour-temperature mode — restore that
+            self.color_temp(state.color_temp)
+        else:
+            # Device was in RGB mode (or scene — see note below)
+            self.color(state.r, state.g, state.b)
+        # NOTE: Scene / DIY / Music modes are not exposed by the Govee API.
+        # If the light was running a scene, the API only returned an RGB or
+        # colorTem approximation.  Full scene restoration is not possible.
 
 
 # ─── Alarm state machine ──────────────────────────────────────────────────────
@@ -602,6 +640,13 @@ class AlarmStateMachine:
                   self.config.test_duration)
 
         saved = dev.get_state()
+        if saved is not None:
+            self._log("debug", "Saved state for %s: %s", dev.label, saved)
+            if not saved.color_temp:
+                self._log("debug",
+                          "Note: %s may be in a scene/DIY mode — will restore to RGB (%d,%d,%d). "
+                          "Scene restoration is not supported by the Govee API.",
+                          dev.label, saved.r, saved.g, saved.b)
 
         # Resolve colour (first frame for animated effects)
         if etype in ("static", "blink"):
@@ -670,6 +715,12 @@ class AlarmStateMachine:
             if state is not None:
                 self._saved_states[dev.id] = state
                 self._log("debug", "Saved state for %s: %s", dev.label, state)
+                self._log("debug",
+                          "Note: scene/DIY/music modes cannot be saved via the Govee API. "
+                          "If %s was running a scene, it will restore to the reported %s.",
+                          dev.label,
+                          f"{state.color_temp}K colour temperature" if state.color_temp
+                          else f"RGB ({state.r},{state.g},{state.b})")
             else:
                 self._log("warning", "Could not read state for %s — will turn off on restore",
                           dev.label)
@@ -1284,6 +1335,8 @@ def _render_ui(status: dict, config: Config) -> str:
     <div style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">
       "All devices" goes through the full alarm sequence (saves &amp; restores state).
       Individual device tests run for <strong>{config.test_duration}s</strong> then restore.
+      <br><span style="color:var(--yellow)">&#9888; Scenes/DIY modes cannot be restored via the Govee API —
+      restore will use the device's reported colour temperature or RGB colour instead.</span>
     </div>
   </div>
 
